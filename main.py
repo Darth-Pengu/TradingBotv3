@@ -1282,6 +1282,86 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
+import asyncio
+import json
+import os
+from aiohttp import web
+
+# ---- BEGIN: Fill these from your bot logic as globals ----
+current_wallet_balance = 0.0
+positions = {}
+activity_log = []
+exposure = 0.0
+daily_loss = 0.0
+
+def get_total_pl():
+    # Example stub: Replace with your real computation
+    return sum([pos.get('pl', 0) for pos in positions.values()])
+
+def calc_winrate():
+    # Example stub
+    wins, total = 0, 0
+    # Populate this logic using your trade logs/stats
+    return 100.0 * wins / total if total else 0
+
+# If your bot tracks more per-strategy stats, add them here
+bot_stats = dict(
+    ultra_wins=0, ultra_total=0, ultra_pl=0,
+    scalper_wins=0, scalper_total=0, scalper_pl=0,
+    community_wins=0, community_total=0, community_pl=0,
+)
+# ---- END MOCKS (replace with actual state!) ----
+
+DASHBOARD_FILE = os.path.abspath("dashboard.html")  # Adjust if your HTML path is elsewhere
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    while True:
+        data = {
+            'wallet_balance': current_wallet_balance,
+            'pl': get_total_pl(),
+            'winrate': calc_winrate(),
+            'positions': positions,
+            'exposure': exposure,
+            'daily_loss': daily_loss,
+            'log': list(activity_log)[-40:],  # last 40 log entries
+            # Unpack bot stats:
+            **bot_stats
+        }
+        await ws.send_str(json.dumps(data))
+        await asyncio.sleep(2)   # Update every 2 seconds
+    # (Never reached)
+    # await ws.close()
+    # return ws
+
+async def html_handler(request):
+    return web.FileResponse(DASHBOARD_FILE)
+
+async def run_dashboard_server(port=8080):
+    app = web.Application()
+    app.router.add_get('/', html_handler)
+    app.router.add_get('/ws', ws_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, port=port)
+    await site.start()
+    print(f"Dashboard up at http://0.0.0.0:{port}")
+
+# ---- To run in your asyncio main() style app ----
+
+if __name__ == "__main__":
+    import sys
+
+    # Set this to your desired port or get from env
+    PORT = int(os.environ.get("PORT", "8080"))
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(run_dashboard_server(PORT))
+    # Also kick off your trading bot main here:
+    # loop.create_task(main())
+
+    loop.run_forever()
 
 # ==== MAIN ====
 
