@@ -667,6 +667,8 @@ async def handle_position_exit(token: str, pos: Dict[str, Any], last_price: floa
     except Exception as e:
         logger.error(f"Position exit handler error for {token}: {e}")
 
+from aiohttp import web
+
 # ==== DASHBOARD ====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -1282,6 +1284,20 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
+
+async def html_handler(request):
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+async def ws_handler(request):
+    # your websocket logic (see previous answers)
+    ...
+
+app = web.Application()
+app.router.add_get('/', html_handler)
+app.router.add_get('/ws', ws_handler)
+
+web.run_app(app, port=8080)
+
 import asyncio
 import json
 import os
