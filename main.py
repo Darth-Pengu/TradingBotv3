@@ -1311,8 +1311,8 @@ async def ws_handler(request):
             "community_total": community_total,
             "community_pl": community_pl,
         }
-        await ws.send_str(json.dumps(data))
-        await asyncio.sleep(2)
+    await ws.send_str(json.dumps(data))
+    await asyncio.sleep(2)
 
 app = web.Application()
 app.router.add_get('/', html_handler)
