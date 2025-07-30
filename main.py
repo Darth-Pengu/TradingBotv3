@@ -364,20 +364,30 @@ async def bitquery_trending_feed(callback):
     if not BITQUERY_API_KEY:
         logger.warning("Bitquery feed not enabled (no API key).")
         return
-
     url = "https://streaming.bitquery.io/graphql"
-    query = """
+     query = """
     {
-      EVM(dataset: combined, network: eth) {
-        Blocks(limit: {count: 1}) {
-          Block {
-            Number
-            Time
+      Solana {
+        DEXTrades(limit: 10, orderBy: {descending: Block_Time}, tradeAmountUsd: {gt: 100}) {
+          transaction {
+            txFrom
           }
+          baseCurrency {
+            address
+          }
+          quoteCurrency {
+            symbol
+          }
+          tradeAmount
+          exchange {
+            fullName
+          }
+          Block_Time
         }
       }
     }
     """
+    payload = {"query": query}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {BITQUERY_API_KEY}"
@@ -387,18 +397,24 @@ async def bitquery_trending_feed(callback):
             session = await get_session()
             try:
                 async def _fetch():
-                    async with session.post(url, json={"query": query}, headers=headers) as resp:
+                    async with session.post(url, json=payload, headers=headers) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise Exception(f"HTTP {resp.status}: {text}")
                         data = await resp.json()
-                        # Defensive data check:
-                        if not data or "data" not in data or "EVM" not in data["data"]:
-                            logger.error(f"Bitquery: Unexpected data shape: {data}")
+                        # Defensive key checks:
+                        if (
+                            not data or
+                            "data" not in data or
+                            "Solana" not in data["data"] or
+                            "DEXTrades" not in data["data"]["Solana"]
+                        ):
+                            logger.error(f"Bitquery unexpected data shape: {data}")
                             return
-                        blocks = data["data"]["EVM"].get("Blocks", [])
-                        for block in blocks:
-                            logger.info(f"Block info: {block}")
+                        for trade in data["data"]["Solana"]["DEXTrades"]:
+                            addr = trade.get("baseCurrency", {}).get("address", "")
+                            if addr:
+                                await callback(addr, "bitquery")
                 await retry_with_backoff(_fetch)
             except Exception as e:
                 logger.error(f"Bitquery feed error: {e}")
