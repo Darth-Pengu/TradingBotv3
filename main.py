@@ -364,37 +364,46 @@ async def bitquery_trending_feed(callback):
     if not BITQUERY_API_KEY:
         logger.warning("Bitquery feed not enabled (no API key).")
         return
-        
+
     url = "https://streaming.bitquery.io/graphql"
-    query = {"query": "{Solana{DEXTrades(limit:10){baseCurrency{address}}}}"}
+    query = """
+    {
+      EVM(dataset: combined, network: eth) {
+        Blocks(limit: {count: 1}) {
+          Block {
+            Number
+            Time
+          }
+        }
+      }
+    }
+    """
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {BITQUERY_API_KEY}"
     }
-    
     while True:
         if not is_circuit_broken("bitquery"):
+            session = await get_session()
             try:
-                session = await get_session()
-                
                 async def _fetch():
-                    async with session.post(url, json=query, headers=headers) as resp:
+                    async with session.post(url, json={"query": query}, headers=headers) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise Exception(f"HTTP {resp.status}: {text}")
                         data = await resp.json()
-                        if data and "data" in data and "Solana" in data["data"]:
-                            for trade in data["data"]["Solana"].get("DEXTrades", []):
-                                addr = trade.get("baseCurrency", {}).get("address", "")
-                                if addr:
-                                    await callback(addr, "bitquery")
-                                    
+                        # Defensive data check:
+                        if not data or "data" not in data or "EVM" not in data["data"]:
+                            logger.error(f"Bitquery: Unexpected data shape: {data}")
+                            return
+                        blocks = data["data"]["EVM"].get("Blocks", [])
+                        for block in blocks:
+                            logger.info(f"Block info: {block}")
                 await retry_with_backoff(_fetch)
             except Exception as e:
                 logger.error(f"Bitquery feed error: {e}")
                 trip_circuit_breaker("bitquery")
-                
-        await asyncio.sleep(180)
+            await asyncio.sleep(180)
 
 # ==== COMMUNITY PERSONALITY VOTE AGGREGATOR ====
 async def community_candidate_callback(token, src):
