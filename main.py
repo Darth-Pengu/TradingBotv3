@@ -1289,7 +1289,7 @@ DASHBOARD_HTML = """
 async def html_handler(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
     
-    async def ws_handler(request):
+async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     while True:
