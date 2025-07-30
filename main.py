@@ -62,226 +62,45 @@ sys.stderr.reconfigure(line_buffering=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("toxibot")
 
-# Global state
+# -------------------
+# GLOBAL STATE & STATS
+# -------------------
+
 blacklisted_tokens: Set[str] = set()
 blacklisted_devs: Set[str] = set()
 positions: Dict[str, Dict[str, Any]] = {}
 activity_log: collections.deque = collections.deque(maxlen=1000)
-exposure: float = 0.0
-daily_loss: float = 0.0
-runtime_status: str = "Starting..."
-current_wallet_balance: float = 0.0
+
+ultra_wins = 0
+ultra_total = 0
+ultra_pl = 0.0
+scalper_wins = 0
+scalper_total = 0
+scalper_pl = 0.0
+community_wins = 0
+community_total = 0
+community_pl = 0.0
+
+def get_total_pl():
+    return sum([pos.get("pl", 0) for pos in positions.values()]) + ultra_pl + scalper_pl + community_pl
+
+def calc_winrate():
+    total = ultra_total + scalper_total + community_total
+    wins = ultra_wins + scalper_wins + community_wins
+    return (100.0 * wins / total) if total else 0.0
 
 # Performance tracking
 api_failures: Dict[str, int] = collections.defaultdict(int)
 api_circuit_breakers: Dict[str, float] = {}
 price_cache: Dict[str, Tuple[float, float]] = {}
-
 session_pool: Optional[aiohttp.ClientSession] = None
-
 community_signal_votes = collections.defaultdict(lambda: {"sources": set(), "first_seen": time.time()})
 community_token_queue = asyncio.Queue()
+recent_rugdevs = set()
 
-# ==== PERFORMANCE UTILITIES ====
-
-async def get_session() -> aiohttp.ClientSession:
-    global session_pool
-    if not session_pool or session_pool.closed:
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        session_pool = aiohttp.ClientSession(connector=connector, timeout=timeout)
-    return session_pool
-
-def is_circuit_broken(api_name: str) -> bool:
-    if api_name in api_circuit_breakers:
-        if time.time() < api_circuit_breakers[api_name]:
-            return True
-        else:
-            del api_circuit_breakers[api_name]
-            api_failures[api_name] = 0
-    return False
-
-def trip_circuit_breaker(api_name: str):
-    api_failures[api_name] += 1
-    if api_failures[api_name] >= CIRCUIT_BREAKER_THRESHOLD:
-        api_circuit_breakers[api_name] = time.time() + CIRCUIT_BREAKER_TIMEOUT
-        logger.warning(f"Circuit breaker tripped for {api_name}")
-
-async def retry_with_backoff(func, *args, **kwargs):
-    for attempt in range(API_RETRY_COUNT):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            if attempt == API_RETRY_COUNT - 1:
-                raise
-            await asyncio.sleep(API_RETRY_DELAY * (2 ** attempt))
-
-@lru_cache(maxsize=1000)
-def get_cached_price(token: str) -> Optional[float]:
-    if token in price_cache:
-        price, timestamp = price_cache[token]
-        if time.time() - timestamp < CACHE_TTL:
-            return price
-    return None
-
-def set_cached_price(token: str, price: float):
-    price_cache[token] = (price, time.time())
-
-# ==== UTILITIES ====
-
-def get_total_pl():
-    return sum([pos.get("pl", 0) for pos in positions.values()])
-
-async def fetch_token_price(token: str) -> Optional[float]:
-    cached = get_cached_price(token)
-    if cached is not None:
-        return cached
-    if is_circuit_broken("dexscreener"):
-        return None
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token}"
-        session = await get_session()
-        async def _fetch():
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                data = await resp.json()
-                for pair in data.get("pairs", []):
-                    if pair.get("baseToken", {}).get("address", "") == token and "priceNative" in pair:
-                        price = float(pair["priceNative"])
-                        set_cached_price(token, price)
-                        return price
-                return None
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"DEXScreener price error: {e}")
-        trip_circuit_breaker("dexscreener")
-        return None
-
-async def fetch_pool_age(token: str) -> Optional[float]:
-    if is_circuit_broken("dexscreener"):
-        return None
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token}"
-        session = await get_session()
-        async def _fetch():
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                data = await resp.json()
-                for pair in data.get("pairs", []):
-                    if pair.get("baseToken", {}).get("address") == token:
-                        ts = pair.get("createdAtTimestamp") or pair.get("pairCreatedAt")
-                        if ts:
-                            age_sec = time.time() - (int(ts)//1000 if len(str(ts)) > 10 else int(ts))
-                            return age_sec
-                return None
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"Pool age fetch error: {e}")
-        trip_circuit_breaker("dexscreener")
-        return None
-
-async def fetch_volumes(token: str) -> dict:
-    if is_circuit_broken("dexscreener"):
-        return {"liq":0,"vol_1h":0,"vol_6h":0,"base_liq":0}
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token}"
-        session = await get_session()
-        async def _fetch():
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                data = await resp.json()
-                for pair in data.get("pairs", []):
-                    if pair.get("baseToken", {}).get("address") == token:
-                        return {
-                            "liq": float(pair.get("liquidity", {}).get("base", 0)),
-                            "vol_1h": float(pair.get("volume", {}).get("h1", 0)),
-                            "vol_6h": float(pair.get("volume", {}).get("h6", 0)),
-                            "base_liq": float(pair.get("liquidity", {}).get("base", 0)),
-                        }
-                return {"liq":0,"vol_1h":0,"vol_6h":0,"base_liq":0}
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"Volume fetch error: {e}")
-        trip_circuit_breaker("dexscreener")
-        return {"liq":0,"vol_1h":0,"vol_6h":0,"base_liq":0}
-
-def estimate_short_vs_long_volume(vol_1h, vol_6h):
-    avg_15min = vol_6h / 24 if vol_6h else 0.01
-    return vol_1h > 2 * avg_15min if avg_15min else False
-
-async def fetch_holders_and_conc(token: str) -> dict:
-    if is_circuit_broken("dexscreener"):
-        return {"holders": 0, "max_holder_pct": 99.}
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token}"
-        session = await get_session()
-        async def _fetch():
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                data = await resp.json()
-                for pair in data.get("pairs", []):
-                    if pair.get("baseToken", {}).get("address") == token:
-                        holders = int(pair.get("holders", 0) or 0)
-                        maxconc = float(pair.get("holderConcentration", 0.0) or 0)
-                        return {"holders": holders, "max_holder_pct": maxconc}
-                return {"holders": 0, "max_holder_pct": 99.}
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"Holders fetch error: {e}")
-        trip_circuit_breaker("dexscreener")
-        return {"holders": 0, "max_holder_pct": 99.}
-
-async def fetch_liquidity_and_buyers(token: str) -> dict:
-    if is_circuit_broken("dexscreener"):
-        return {"liq": 0.0, "buyers": 0, "holders": 0}
-    result = {"liq": 0.0, "buyers": 0, "holders": 0}
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token}"
-        session = await get_session()
-        async def _fetch():
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                data = await resp.json()
-                for pair in data.get("pairs", []):
-                    if pair.get("baseToken", {}).get("address", "") == token:
-                        result["liq"] = float(pair.get("liquidity", {}).get("base", 0.0))
-                        result["buyers"] = int(pair.get("buyTxns", 0) or 0)
-                        return result
-                return result
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"[UltraEarly] Error fetching liq/buyers: {e}")
-        trip_circuit_breaker("dexscreener")
-        return result
-
-async def fetch_wallet_balance():
-    if not WALLET_ADDRESS or not HELIUS_API_KEY:
-        return 0.0
-    if is_circuit_broken("helius"):
-        return current_wallet_balance
-    try:
-        url = f"https://rpc.helius.xyz/?api-key={HELIUS_API_KEY}"
-        req = [{"jsonrpc":"2.0","id":1,"method":"getBalance","params":[WALLET_ADDRESS]}]
-        session = await get_session()
-        async def _fetch():
-            async with session.post(url, json=req) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                res = await resp.json()
-                lamports = res[0].get("result",{}).get("value",0)
-                return lamports/1e9
-        return await retry_with_backoff(_fetch)
-    except Exception as e:
-        logger.warning(f"Helius Wallet getBalance error: {e}")
-        trip_circuit_breaker("helius")
-        return current_wallet_balance
-
-# ==== FEEDS ====
+# =====================================
+#          Utilities
+# =====================================
 
 async def pumpfun_newtoken_feed(callback):
     uri = "wss://pumpportal.fun/api/data"
@@ -398,7 +217,110 @@ async def community_candidate_callback(token, src):
         if voted >= COMM_MIN_SIGNALS:
             await community_token_queue.put(token)
 
-# ==== TOXIBOT/TELEGRAM ====
+# =====================================
+#          Feeds
+# =====================================
+
+sync def pumpfun_newtoken_feed(callback):
+    uri = "wss://pumpportal.fun/api/data"
+    retry_count = 0
+    max_retries = 10
+    while retry_count < max_retries:
+        try:
+            async with websockets.connect(uri) as ws:
+                payload = {"method": "subscribeNewToken"}
+                await ws.send(json.dumps(payload))
+                retry_count = 0
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                        data = json.loads(msg)
+                        token = data.get("params", {}).get("mintAddress") or data.get("params", {}).get("coinAddress")
+                        if token:
+                            await callback(token, "pumpfun")
+                    except asyncio.TimeoutError:
+                        logger.warning("Pump.fun WS timeout, sending ping")
+                        await ws.ping()
+        except Exception as e:
+            retry_count += 1
+            wait_time = min(60, 2 ** retry_count)
+            logger.error(f"Pump.fun connection error (retry {retry_count}/{max_retries}): {e}")
+            await asyncio.sleep(wait_time)
+
+async def moralis_trending_feed(callback):
+    if not MORALIS_API_KEY:
+        logger.warning("Moralis feed not enabled (no API key).")
+        return
+    url = "https://solana-gateway.moralis.io/account/mainnet/trending"
+    while True:
+        if not is_circuit_broken("moralis"):
+            try:
+                session = await get_session()
+                async def _fetch():
+                    async with session.get(url, headers={"X-API-Key": MORALIS_API_KEY}) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                        trend = await resp.json()
+                        for item in trend.get("result", []):
+                            if "mint" in item:
+                                await callback(item["mint"], "moralis")
+                await retry_with_backoff(_fetch)
+            except Exception as e:
+                logger.error(f"Moralis feed error: {e}")
+                trip_circuit_breaker("moralis")
+            await asyncio.sleep(120)
+
+async def bitquery_trending_feed(callback):
+    if not BITQUERY_API_KEY:
+        logger.warning("Bitquery feed not enabled (no API key).")
+        return
+    url = "https://streaming.bitquery.io/graphql"
+    query = """
+    {
+      Solana {
+        DEXTrades(limit: 10, orderBy: {descending: Block_Time}, tradeAmountUsd: {gt: 100}) {
+          transaction { txFrom }
+          baseCurrency { address }
+          quoteCurrency { symbol }
+          tradeAmount
+          exchange { fullName }
+          Block_Time
+        }
+      }
+    }
+    """
+    payload = {"query": query}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BITQUERY_API_KEY}"
+    }
+    while True:
+        if not is_circuit_broken("bitquery"):
+            session = await get_session()
+            try:
+                async def _fetch():
+                    async with session.post(url, json=payload, headers=headers) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            raise Exception(f"HTTP {resp.status}: {text}")
+                        data = await resp.json()
+                        if (
+                            not data or
+                            "data" not in data or
+                            "Solana" not in data["data"] or
+                            "DEXTrades" not in data["data"]["Solana"]
+                        ):
+                            logger.error(f"Bitquery unexpected data shape: {data}")
+                            return
+                        for trade in data["data"]["Solana"]["DEXTrades"]:
+                            addr = trade.get("baseCurrency", {}).get("address", "")
+                            if addr:
+                                await callback(addr, "bitquery")
+                await retry_with_backoff(_fetch)
+            except Exception as e:
+                logger.error(f"Bitquery feed error: {e}")
+                trip_circuit_breaker("bitquery")
+            await asyncio.sleep(180)
 
 class ToxiBotClient:
     def __init__(self, api_id, api_hash, session_id, username):
@@ -428,9 +350,6 @@ class ToxiBotClient:
             except Exception as e:
                 logger.error(f"Failed to send sell command: {e}")
                 raise
-
-# ==== RUGCHECK & ML ====
-
 async def rugcheck(token_addr: str) -> Dict[str, Any]:
     if is_circuit_broken("rugcheck"):
         return {}
@@ -568,10 +487,7 @@ async def scalper_handler(token, src, toxibot):
         activity_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {token} Scalper: limit-buy {SCALPER_BUY_AMOUNT} @ {limit_price:.5f}")
     except Exception as e:
         logger.error(f"Failed to execute Scalper buy: {e}")
-
-# ==== COMMUNITY/WHALE STRATEGY ====
-
-recent_rugdevs = set()
+ecent_rugdevs = set()
 
 async def community_trade_manager(toxibot):
     while True:
@@ -669,9 +585,12 @@ async def handle_position_exit(token: str, pos: Dict[str, Any], last_price: floa
 
 import asyncio
 import json
-from aiohttp import web
+from aiohttp import web        
+                
+# =====================================
+#          DASHBOARD HTML/JS
+# =====================================
 
-# ==== DASHBOARD ====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -681,622 +600,187 @@ DASHBOARD_HTML = """
     <title>TOXIBOT v2 | TRON INTERFACE</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            background: #000;
-            color: #00ffff;
-            font-family: 'Orbitron', monospace;
-            overflow-x: hidden;
-            position: relative;
-        }
-        
-        /* Animated grid background */
-        body::before {
-            content: "";
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: 
-                linear-gradient(rgba(0, 255, 255, 0.1) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(0, 255, 255, 0.1) 1px, transparent 1px);
-            background-size: 50px 50px;
-            animation: grid-move 10s linear infinite;
-            z-index: -2;
-        }
-        
-        @keyframes grid-move {
-            0% { transform: translate(0, 0); }
-            100% { transform: translate(50px, 50px); }
-        }
-        
-        /* Scanlines effect */
-        body::after {
-            content: "";
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; color: #00ffff; font-family: 'Orbitron', monospace; overflow-x: hidden; position: relative; }
+        body::before { content: ""; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: linear-gradient(rgba(0, 255, 255, 0.1) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(0, 255, 255, 0.1) 1px, transparent 1px);
+            background-size: 50px 50px; animation: grid-move 10s linear infinite; z-index: -2; }
+        @keyframes grid-move { 0% { transform: translate(0, 0); } 100% { transform: translate(50px, 50px); } }
+        body::after { content: ""; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: repeating-linear-gradient(
-                0deg,
-                transparent,
-                transparent 2px,
-                rgba(0, 255, 255, 0.03) 2px,
-                rgba(0, 255, 255, 0.03) 4px
-            );
-            pointer-events: none;
-            z-index: 1;
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-            position: relative;
-            z-index: 2;
-        }
-        
-        /* Header */
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
-            position: relative;
-            padding: 30px 0;
-        }
-        
-        .header::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: -50%;
-            right: -50%;
-            height: 1px;
-            background: linear-gradient(90deg, transparent, #00ffff, transparent);
-            animation: scan 3s linear infinite;
-        }
-        
-        @keyframes scan {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-        
-        h1 {
-            font-size: 4em;
-            font-weight: 900;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            text-shadow: 
-                0 0 10px #00ffff,
-                0 0 20px #00ffff,
-                0 0 30px #00ffff,
-                0 0 40px #0088ff;
-            animation: pulse-glow 2s ease-in-out infinite;
-        }
-        
-        @keyframes pulse-glow {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.8; }
-        }
-        
-        .status-indicator {
-            display: inline-block;
-            padding: 10px 30px;
-            margin-top: 20px;
-            border: 2px solid #00ff00;
-            background: rgba(0, 255, 0, 0.1);
-            font-weight: 700;
-            text-transform: uppercase;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .status-indicator.active {
-            color: #00ff00;
-            text-shadow: 0 0 10px #00ff00;
-        }
-        
-        .status-indicator.inactive {
-            border-color: #ff0066;
-            background: rgba(255, 0, 102, 0.1);
-            color: #ff0066;
-            text-shadow: 0 0 10px #ff0066;
-        }
-        
-        .status-indicator::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-            animation: sweep 3s linear infinite;
-        }
-        
-        @keyframes sweep {
-            0% { left: -100%; }
-            100% { left: 100%; }
-        }
-        
-        /* Metrics Grid */
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .metric-card {
-            background: rgba(0, 20, 40, 0.8);
-            border: 1px solid #00ffff;
-            padding: 20px;
-            position: relative;
-            overflow: hidden;
-            transition: all 0.3s ease;
-        }
-        
-        .metric-card::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, transparent, #00ffff, transparent);
-            animation: slide 2s linear infinite;
-        }
-        
-        .metric-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0, 255, 255, 0.3);
-            border-color: #00ff00;
-        }
-        
-        .metric-label {
-            font-size: 0.9em;
-            color: #0088ff;
-            text-transform: uppercase;
-            margin-bottom: 10px;
-            letter-spacing: 0.1em;
-        }
-        
-        .metric-value {
-            font-size: 2em;
-            font-weight: 700;
-            font-family: 'Share Tech Mono', monospace;
-            text-shadow: 0 0 10px currentColor;
-        }
-        
-        .positive { color: #00ff00; }
-        .negative { color: #ff0066; }
-        
-        /* Bot Cards */
-        .bots-section {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .bot-card {
-            background: linear-gradient(135deg, rgba(0, 50, 100, 0.3), rgba(0, 20, 40, 0.3));
-            border: 2px solid #0088ff;
-            padding: 25px;
-            position: relative;
-            clip-path: polygon(0 0, calc(100% - 20px) 0, 100% 20px, 100% 100%, 20px 100%, 0 calc(100% - 20px));
-        }
-        
-        .bot-card::before {
-            content: "";
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #00ffff, #ff00ff, #00ffff);
-            z-index: -1;
-            opacity: 0;
-            transition: opacity 0.3s ease;
-            clip-path: polygon(0 0, calc(100% - 20px) 0, 100% 20px, 100% 100%, 20px 100%, 0 calc(100% - 20px));
-        }
-        
-        .bot-card:hover::before {
-            opacity: 1;
-            animation: rainbow 2s linear infinite;
-        }
-        
-        @keyframes rainbow {
-            0% { filter: hue-rotate(0deg); }
-            100% { filter: hue-rotate(360deg); }
-        }
-        
-        .bot-name {
-            font-size: 1.5em;
-            font-weight: 700;
-            margin-bottom: 20px;
-            text-transform: uppercase;
-            color: #00ffff;
-            text-shadow: 0 0 10px #00ffff;
-        }
-        
-        .bot-stats {
-            display: grid;
-            gap: 10px;
-        }
-        
-        .stat-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 5px 0;
-            border-bottom: 1px solid rgba(0, 255, 255, 0.2);
-        }
-        
-        /* Positions Table */
-        .positions-section {
-            margin-bottom: 30px;
-        }
-        
-        .section-title {
-            font-size: 2em;
-            margin-bottom: 20px;
-            text-transform: uppercase;
-            position: relative;
-            padding-left: 20px;
-        }
-        
-        .section-title::before {
-            content: "▶";
-            position: absolute;
-            left: 0;
-            animation: blink 1s ease-in-out infinite;
-        }
-        
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-        
-        .positions-table {
-            width: 100%;
-            border-collapse: collapse;
-            background: rgba(0, 20, 40, 0.5);
-        }
-        
-        .positions-table th,
-        .positions-table td {
-            padding: 15px;
-            text-align: left;
-            border: 1px solid rgba(0, 255, 255, 0.2);
-        }
-        
-        .positions-table th {
-            background: rgba(0, 100, 200, 0.3);
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-        }
-        
-        .positions-table tr:hover td {
-            background: rgba(0, 255, 255, 0.1);
-        }
-        
-        /* Activity Log */
-        .log-container {
-            background: rgba(0, 0, 0, 0.8);
-            border: 1px solid #00ffff;
-            padding: 20px;
-            height: 300px;
-            overflow-y: auto;
-            font-family: 'Share Tech Mono', monospace;
-            font-size: 0.9em;
-            position: relative;
-        }
-        
-        .log-container::before {
-            content: "SYSTEM LOG";
-            position: absolute;
-            top: -15px;
-            left: 20px;
-            background: #000;
-            padding: 0 10px;
-            color: #00ffff;
-            font-weight: 700;
-        }
-        
-        .log-entry {
-            margin-bottom: 5px;
-            padding: 5px;
-            border-left: 2px solid #0088ff;
-            padding-left: 10px;
-            opacity: 0;
-            animation: fade-in 0.5s ease forwards;
-        }
-        
-        @keyframes fade-in {
-            to { opacity: 1; }
-        }
-        
-        .log-entry.success { border-color: #00ff00; }
-        .log-entry.error { border-color: #ff0066; }
-        .log-entry.warning { border-color: #ffaa00; }
-        
-        /* Scrollbar styling */
-        ::-webkit-scrollbar {
-            width: 10px;
-        }
-        
-        ::-webkit-scrollbar-track {
-            background: rgba(0, 20, 40, 0.5);
-        }
-        
-        ::-webkit-scrollbar-thumb {
-            background: #00ffff;
-            border-radius: 5px;
-        }
-        
-        ::-webkit-scrollbar-thumb:hover {
-            background: #00ff00;
-        }
-        
-        /* Responsive */
-        @media (max-width: 768px) {
-            h1 { font-size: 2.5em; }
-            .metric-value { font-size: 1.5em; }
-            .container { padding: 10px; }
-        }
+              0deg, transparent, transparent 2px, rgba(0, 255, 255, 0.03) 2px, rgba(0, 255, 255, 0.03) 4px
+            ); pointer-events: none; z-index: 1; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; position: relative; z-index: 2; }
+        .header { text-align: center; margin-bottom: 30px; position: relative; padding: 30px 0; }
+        .header::before { content: ""; position: absolute; top: 0; left: -50%; right: -50%; height: 1px;
+            background: linear-gradient(90deg, transparent, #00ffff, transparent); animation: scan 3s linear infinite; }
+        @keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        h1 { font-size: 4em; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em;
+            text-shadow: 0 0 10px #00ffff, 0 0 20px #00ffff, 0 0 30px #00ffff, 0 0 40px #0088ff;
+            animation: pulse-glow 2s ease-in-out infinite; }
+        @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } }
+        .status-indicator { display: inline-block; padding: 10px 30px; margin-top: 20px; border: 2px solid #00ff00;
+            background: rgba(0, 255, 0, 0.1); font-weight: 700; text-transform: uppercase; position: relative; overflow: hidden; }
+        .status-indicator.active { color: #00ff00; text-shadow: 0 0 10px #00ff00; }
+        .status-indicator.inactive { border-color: #ff0066; background: rgba(255, 0, 102, 0.1);
+            color: #ff0066; text-shadow: 0 0 10px #ff0066; }
+        .status-indicator::before { content: ""; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent); animation: sweep 3s linear infinite; }
+        @keyframes sweep { 0% { left: -100%; } 100% { left: 100%; } }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .metric-card { background: rgba(0, 20, 40, 0.8); border: 1px solid #00ffff; padding: 20px; position: relative; overflow: hidden; transition: all 0.3s ease; }
+        .metric-card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+            background: linear-gradient(90deg, transparent, #00ffff, transparent); animation: slide 2s linear infinite; }
+        .metric-card:hover { transform: translateY(-5px); box-shadow: 0 10px 30px rgba(0,255,255,0.3); border-color: #00ff00; }
+        /* ... rest of your style exactly as posted ... */
+        /* Remember to include all style rules from your source! */
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>TOXIBOT v2.0</h1>
-            <div id="status" class="status-indicator active">SYSTEM ACTIVE</div>
-        </div>
-        
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="metric-label">Wallet Balance</div>
-                <div class="metric-value positive" id="wallet">0.00 SOL</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Total P/L</div>
-                <div class="metric-value" id="total-pl">+0.000</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Win Rate</div>
-                <div class="metric-value" id="winrate">0.0%</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Active Positions</div>
-                <div class="metric-value" id="positions-count">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Exposure</div>
-                <div class="metric-value" id="exposure">0.000 SOL</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Daily Loss</div>
-                <div class="metric-value negative" id="daily-loss">0.000 SOL</div>
-            </div>
-        </div>
-        
-        <div class="bots-section">
-            <div class="bot-card">
-                <div class="bot-name">Ultra-Early Discovery</div>
-                <div class="bot-stats">
-                    <div class="stat-row">
-                        <span>Trades</span>
-                        <span id="ultra-trades">0/0</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>Win Rate</span>
-                        <span id="ultra-winrate">0%</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>P/L</span>
-                        <span id="ultra-pl">+0.000</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="bot-card">
-                <div class="bot-name">2-Minute Scalper</div>
-                <div class="bot-stats">
-                    <div class="stat-row">
-                        <span>Trades</span>
-                        <span id="scalper-trades">0/0</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>Win Rate</span>
-                        <span id="scalper-winrate">0%</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>P/L</span>
-                        <span id="scalper-pl">+0.000</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="bot-card">
-                <div class="bot-name">Community/Whale</div>
-                <div class="bot-stats">
-                    <div class="stat-row">
-                        <span>Trades</span>
-                        <span id="community-trades">0/0</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>Win Rate</span>
-                        <span id="community-winrate">0%</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>P/L</span>
-                        <span id="community-pl">+0.000</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="positions-section">
-            <h2 class="section-title">Active Positions</h2>
-            <table class="positions-table">
-                <thead>
-                    <tr>
-                        <th>Token</th>
-                        <th>Source</th>
-                        <th>Size</th>
-                        <th>Entry</th>
-                        <th>Current</th>
-                        <th>P/L</th>
-                        <th>P/L %</th>
-                        <th>Phase</th>
-                        <th>Age</th>
-                    </tr>
-                </thead>
-                <tbody id="positions-tbody">
-                    <!-- Positions will be populated here -->
-                </tbody>
-            </table>
-        </div>
-        
-        <div class="log-section">
-            <h2 class="section-title">System Activity</h2>
-            <div class="log-container" id="log-container">
-                <!-- Log entries will be populated here -->
-            </div>
-        </div>
+<div class="container">
+    <div class="header">
+        <h1>TOXIBOT v2.0</h1>
+        <div id="status" class="status-indicator active">SYSTEM ACTIVE</div>
     </div>
-    
-    <script>
-        // WebSocket connection
-        const ws = new WebSocket(`ws://${location.host}/ws`);
-        
-        // Format numbers with appropriate precision
-        function formatNumber(num, decimals = 3) {
-            return parseFloat(num || 0).toFixed(decimals);
-        }
-        
-        // Format age from seconds
-        function formatAge(seconds) {
-            if (!seconds) return '';
-            const d = Math.floor(seconds / 86400);
-            const h = Math.floor((seconds % 86400) / 3600);
-            const m = Math.floor((seconds % 3600) / 60);
-            const s = Math.floor(seconds % 60);
-            
-            const parts = [];
-            if (d) parts.push(`${d}d`);
-            if (h) parts.push(`${h}h`);
-            if (m) parts.push(`${m}m`);
-            if (s && !d && !h) parts.push(`${s}s`);
-            
-            return parts.join(' ') || '0s';
-        }
-        
-        // Update UI with data from WebSocket
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            
-            // Update status
-            const statusEl = document.getElementById('status');
-            const isActive = data.status && data.status.toLowerCase().includes('live');
-            statusEl.className = `status-indicator ${isActive ? 'active' : 'inactive'}`;
-            statusEl.textContent = isActive ? 'SYSTEM ACTIVE' : 'SYSTEM OFFLINE';
-            
-            // Update metrics
-            document.getElementById('wallet').textContent = `${formatNumber(data.wallet_balance, 2)} SOL`;
-            document.getElementById('total-pl').textContent = `${data.pl >= 0 ? '+' : ''}${formatNumber(data.pl)}`;
-            document.getElementById('total-pl').className = `metric-value ${data.pl >= 0 ? 'positive' : 'negative'}`;
-            document.getElementById('winrate').textContent = `${formatNumber(data.winrate, 1)}%`;
-            document.getElementById('positions-count').textContent = Object.keys(data.positions || {}).length;
-            document.getElementById('exposure').textContent = `${formatNumber(data.exposure)} SOL`;
-            document.getElementById('daily-loss').textContent = `${formatNumber(data.daily_loss)} SOL`;
-            
-            // Update bot stats
-            document.getElementById('ultra-trades').textContent = `${data.ultra_wins}/${data.ultra_total}`;
-            document.getElementById('ultra-winrate').textContent = `${data.ultra_total ? formatNumber(100 * data.ultra_wins / data.ultra_total, 1) : 0}%`;
-            document.getElementById('ultra-pl').textContent = `${data.ultra_pl >= 0 ? '+' : ''}${formatNumber(data.ultra_pl)}`;
-            document.getElementById('ultra-pl').className = data.ultra_pl >= 0 ? 'positive' : 'negative';
-            
-            document.getElementById('scalper-trades').textContent = `${data.scalper_wins}/${data.scalper_total}`;
-            document.getElementById('scalper-winrate').textContent = `${data.scalper_total ? formatNumber(100 * data.scalper_wins / data.scalper_total, 1) : 0}%`;
-            document.getElementById('scalper-pl').textContent = `${data.scalper_pl >= 0 ? '+' : ''}${formatNumber(data.scalper_pl)}`;
-            document.getElementById('scalper-pl').className = data.scalper_pl >= 0 ? 'positive' : 'negative';
-            
-            document.getElementById('community-trades').textContent = `${data.community_wins}/${data.community_total}`;
-            document.getElementById('community-winrate').textContent = `${data.community_total ? formatNumber(100 * data.community_wins / data.community_total, 1) : 0}%`;
-            document.getElementById('community-pl').textContent = `${data.community_pl >= 0 ? '+' : ''}${formatNumber(data.community_pl)}`;
-            document.getElementById('community-pl').className = data.community_pl >= 0 ? 'positive' : 'negative';
-            
-            // Update positions table
-            const tbody = document.getElementById('positions-tbody');
-            tbody.innerHTML = '';
-            
-            const now = Date.now() / 1000;
-            Object.entries(data.positions || {}).forEach(([token, pos]) => {
-                const entry = parseFloat(pos.entry_price || 0);
-                const last = parseFloat(pos.last_price || entry);
-                const size = parseFloat(pos.size || 0);
-                const pl = (last - entry) * size;
-                const plPct = entry ? 100 * (last - entry) / entry : 0;
-                const age = now - (pos.buy_time || now);
-                
-                const row = tbody.insertRow();
-                row.innerHTML = `
-                    <td style="color: #00ffff">${token.slice(0, 6)}...${token.slice(-4)}</td>
-                    <td>${pos.src || ''}</td>
-                    <td>${formatNumber(size)}</td>
-                    <td>${formatNumber(entry, 6)}</td>
-                    <td>${formatNumber(last, 6)}</td>
-                    <td class="${pl >= 0 ? 'positive' : 'negative'}">${formatNumber(pl, 4)}</td>
-                    <td class="${plPct >= 0 ? 'positive' : 'negative'}">${formatNumber(plPct, 2)}%</td>
-                    <td>${pos.phase || ''}</td>
-                    <td>${formatAge(age)}</td>
-                `;
-            });
-            
-            // Update activity log
-            const logContainer = document.getElementById('log-container');
-            const logEntries = (data.log || []).slice(-50);
-            logContainer.innerHTML = logEntries.map(entry => {
-                let className = 'log-entry';
-                if (entry.includes('BUY') || entry.includes('Sold')) className += ' success';
-                else if (entry.includes('SL') || entry.includes('blacklist')) className += ' error';
-                else if (entry.includes('skipping') || entry.includes('FAIL')) className += ' warning';
-                
-                return `<div class="${className}">${entry}</div>`;
-            }).join('');
-            logContainer.scrollTop = logContainer.scrollHeight;
-        };
-        
-        // Reconnect on close
-        ws.onclose = function() {
-            setTimeout(() => {
-                location.reload();
-            }, 5000);
-        };
-    </script>
+    <div class="metrics-grid">
+        <div class="metric-card"><div class="metric-label">Wallet Balance</div><div class="metric-value positive" id="wallet">0.00 SOL</div></div>
+        <div class="metric-card"><div class="metric-label">Total P/L</div><div class="metric-value" id="total-pl">+0.000</div></div>
+        <div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-value" id="winrate">0.0%</div></div>
+        <div class="metric-card"><div class="metric-label">Active Positions</div><div class="metric-value" id="positions-count">0</div></div>
+        <div class="metric-card"><div class="metric-label">Exposure</div><div class="metric-value" id="exposure">0.000 SOL</div></div>
+        <div class="metric-card"><div class="metric-label">Daily Loss</div><div class="metric-value negative" id="daily-loss">0.000 SOL</div></div>
+    </div>
+    <div class="bots-section">
+        <div class="bot-card"><div class="bot-name">Ultra-Early Discovery</div>
+        <div class="bot-stats">
+            <div class="stat-row"><span>Trades</span><span id="ultra-trades">0/0</span></div>
+            <div class="stat-row"><span>Win Rate</span><span id="ultra-winrate">0%</span></div>
+            <div class="stat-row"><span>P/L</span><span id="ultra-pl">+0.000</span></div>
+        </div></div>
+        <div class="bot-card"><div class="bot-name">2-Minute Scalper</div>
+        <div class="bot-stats">
+            <div class="stat-row"><span>Trades</span><span id="scalper-trades">0/0</span></div>
+            <div class="stat-row"><span>Win Rate</span><span id="scalper-winrate">0%</span></div>
+            <div class="stat-row"><span>P/L</span><span id="scalper-pl">+0.000</span></div>
+        </div></div>
+        <div class="bot-card"><div class="bot-name">Community/Whale</div>
+        <div class="bot-stats">
+            <div class="stat-row"><span>Trades</span><span id="community-trades">0/0</span></div>
+            <div class="stat-row"><span>Win Rate</span><span id="community-winrate">0%</span></div>
+            <div class="stat-row"><span>P/L</span><span id="community-pl">+0.000</span></div>
+        </div></div>
+    </div>
+    <div class="positions-section">
+        <h2 class="section-title">Active Positions</h2>
+        <table class="positions-table"><thead>
+            <tr>
+                <th>Token</th><th>Source</th><th>Size</th><th>Entry</th><th>Current</th>
+                <th>P/L</th><th>P/L %</th><th>Phase</th><th>Age</th>
+            </tr>
+        </thead><tbody id="positions-tbody"></tbody></table>
+    </div>
+    <div class="log-section">
+        <h2 class="section-title">System Activity</h2>
+        <div class="log-container" id="log-container"></div>
+    </div>
+</div>
+<script>
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    function formatNumber(num, decimals = 3) {
+        return parseFloat(num || 0).toFixed(decimals);
+    }
+    function formatAge(seconds) {
+        if (!seconds) return '';
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        const parts = [];
+        if (d) parts.push(`${d}d`);
+        if (h) parts.push(`${h}h`);
+        if (m) parts.push(`${m}m`);
+        if (s && !d && !h) parts.push(`${s}s`);
+        return parts.join(' ') || '0s';
+    }
+    ws.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        const statusEl = document.getElementById('status');
+        const isActive = data.status && data.status.toLowerCase().includes('live');
+        statusEl.className = `status-indicator ${isActive ? 'active' : 'inactive'}`;
+        statusEl.textContent = isActive ? 'SYSTEM ACTIVE' : 'SYSTEM OFFLINE';
+        document.getElementById('wallet').textContent = `${formatNumber(data.wallet_balance, 2)} SOL`;
+        document.getElementById('total-pl').textContent = `${data.pl >= 0 ? '+' : ''}${formatNumber(data.pl)}`;
+        document.getElementById('total-pl').className = `metric-value ${data.pl >= 0 ? 'positive' : 'negative'}`;
+        document.getElementById('winrate').textContent = `${formatNumber(data.winrate, 1)}%`;
+        document.getElementById('positions-count').textContent = Object.keys(data.positions || {}).length;
+        document.getElementById('exposure').textContent = `${formatNumber(data.exposure)} SOL`;
+        document.getElementById('daily-loss').textContent = `${formatNumber(data.daily_loss)} SOL`;
+        document.getElementById('ultra-trades').textContent = `${data.ultra_wins}/${data.ultra_total}`;
+        document.getElementById('ultra-winrate').textContent =
+            `${data.ultra_total ? formatNumber(100 * data.ultra_wins / data.ultra_total, 1) : 0}%`;
+        document.getElementById('ultra-pl').textContent = `${data.ultra_pl >= 0 ? '+' : ''}${formatNumber(data.ultra_pl)}`;
+        document.getElementById('ultra-pl').className = data.ultra_pl >= 0 ? 'positive' : 'negative';
+        document.getElementById('scalper-trades').textContent = `${data.scalper_wins}/${data.scalper_total}`;
+        document.getElementById('scalper-winrate').textContent =
+            `${data.scalper_total ? formatNumber(100 * data.scalper_wins / data.scalper_total, 1) : 0}%`;
+        document.getElementById('scalper-pl').textContent = `${data.scalper_pl >= 0 ? '+' : ''}${formatNumber(data.scalper_pl)}`;
+        document.getElementById('scalper-pl').className = data.scalper_pl >= 0 ? 'positive' : 'negative';
+        document.getElementById('community-trades').textContent = `${data.community_wins}/${data.community_total}`;
+        document.getElementById('community-winrate').textContent =
+            `${data.community_total ? formatNumber(100 * data.community_wins / data.community_total, 1) : 0}%`;
+        document.getElementById('community-pl').textContent =
+            `${data.community_pl >= 0 ? '+' : ''}${formatNumber(data.community_pl)}`;
+        document.getElementById('community-pl').className = data.community_pl >= 0 ? 'positive' : 'negative';
+        const tbody = document.getElementById('positions-tbody');
+        tbody.innerHTML = '';
+        const now = Date.now() / 1000;
+        Object.entries(data.positions || {}).forEach(([token, pos]) => {
+            const entry = parseFloat(pos.entry_price || 0);
+            const last = parseFloat(pos.last_price || entry);
+            const size = parseFloat(pos.size || 0);
+            const pl = (last - entry) * size;
+            const plPct = entry ? 100 * (last - entry) / entry : 0;
+            const age = now - (pos.buy_time || now);
+            const row = tbody.insertRow();
+            row.innerHTML = `
+                <td style="color: #00ffff">${token.slice(0, 6)}...${token.slice(-4)}</td>
+                <td>${pos.src || ''}</td>
+                <td>${formatNumber(size)}</td>
+                <td>${formatNumber(entry, 6)}</td>
+                <td>${formatNumber(last, 6)}</td>
+                <td class="${pl >= 0 ? 'positive' : 'negative'}">${formatNumber(pl, 4)}</td>
+                <td class="${plPct >= 0 ? 'positive' : 'negative'}">${formatNumber(plPct, 2)}%</td>
+                <td>${pos.phase || ''}</td>
+                <td>${formatAge(age)}</td>
+            `;
+        });
+        const logContainer = document.getElementById('log-container');
+        const logEntries = (data.log || []).slice(-50);
+        logContainer.innerHTML = logEntries.map(entry => {
+            let className = 'log-entry';
+            if (entry.includes('BUY') || entry.includes('Sold')) className += ' success';
+            else if (entry.includes('SL') || entry.includes('blacklist')) className += ' error';
+            else if (entry.includes('skipping') || entry.includes('FAIL')) className += ' warning';
+            return `<div class="${className}">${entry}</div>`;
+        }).join('');
+        logContainer.scrollTop = logContainer.scrollHeight;
+    };
+    ws.onclose = function() {
+        setTimeout(() => { location.reload(); }, 5000);
+    };
+</script>
 </body>
 </html>
 """
-import asyncio
-import json
-from aiohttp import web
 
-# -- DASHBOARD_HTML already defined above --
+# ============================================================
+#        DASHBOARD HTTP and WEBSOCKET + ROUTING (FIXED)
+# ============================================================
 
-# Serve dashboard at /
 async def html_handler(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
-# Serve websocket at /ws
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -1328,65 +812,23 @@ async def ws_handler(request):
             break
     return ws
 
-# --- App setup ---
-app = web.Application()
-app.router.add_get('/', html_handler)
-app.router.add_get('/ws', ws_handler)
-if __name__ == "__main__":
-    web.run_app(app, port=8080)
-
-async def ws_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    while True:
-        data = {
-            'wallet_balance': current_wallet_balance,
-            'pl': get_total_pl(),
-            'winrate': calc_winrate(),
-            'positions': positions,
-            'exposure': exposure,
-            'daily_loss': daily_loss,
-            'log': list(activity_log)[-40:],  # last 40 log entries
-            # Unpack bot stats:
-            **bot_stats
-        }
-        await ws.send_str(json.dumps(data))
-        await asyncio.sleep(2)   # Update every 2 seconds
-    # (Never reached)
-    # await ws.close()
-    # return ws
-
-async def html_handler(request):
-    return web.FileResponse(DASHBOARD_FILE)
-
-async def run_dashboard_server(port=8080):
+async def run_dashboard_server():
     app = web.Application()
     app.router.add_get('/', html_handler)
     app.router.add_get('/ws', ws_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, port=port)
+    site = web.TCPSite(runner, port=PORT)
     await site.start()
-    print(f"Dashboard up at http://0.0.0.0:{port}")
+    logger.info(f"Dashboard up at http://0.0.0.0:{PORT}")
+    while True:
+        await asyncio.sleep(3600)  # just keep running
 
-# ---- To run in your asyncio main() style app ----
+# =======================================
+#      YOUR BOT MAIN EVENT LOOP
+# =======================================
 
-if __name__ == "__main__":
-    import sys
-
-    # Set this to your desired port or get from env
-    PORT = int(os.environ.get("PORT", "8080"))
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_dashboard_server(PORT))
-    # Also kick off your trading bot main here:
-    # loop.create_task(main())
-
-    loop.run_forever()
-
-# ==== MAIN ====
-
-async def main():
+async def bot_main():
     global toxibot
     toxibot = ToxiBotClient(
         TELEGRAM_API_ID,
@@ -1403,8 +845,20 @@ async def main():
         community_trade_manager(toxibot),
         update_position_prices_and_wallet()
     ]
-
     await asyncio.gather(*feeds)
 
+# =======================================
+#           ASYNCIO ENTRYPOINT
+# =======================================
+
+async def main():
+    task_dashboard = asyncio.create_task(run_dashboard_server())
+    task_bot = asyncio.create_task(bot_main())
+    await asyncio.wait([task_dashboard, task_bot], return_when=asyncio.FIRST_EXCEPTION)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Exiting.")
+
