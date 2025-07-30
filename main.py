@@ -667,6 +667,8 @@ async def handle_position_exit(token: str, pos: Dict[str, Any], last_price: floa
     except Exception as e:
         logger.error(f"Position exit handler error for {token}: {e}")
 
+import asyncio
+import json
 from aiohttp import web
 
 # ==== DASHBOARD ====
@@ -1284,51 +1286,40 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
-
 async def html_handler(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
-
-async def ws_handler(request):
-    # your websocket logic (see previous answers)
-    ...
+    
+    async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    while True:
+         data = {
+            "wallet_balance": current_wallet_balance,
+            "pl": get_total_pl(),
+            "winrate": calc_winrate(),
+            "positions": positions,
+            "exposure": exposure,
+            "daily_loss": daily_loss,
+            "log": list(activity_log)[-40:],
+            "ultra_wins": ultra_wins,
+            "ultra_total": ultra_total,
+            "ultra_pl": ultra_pl,
+            "scalper_wins": scalper_wins,
+            "scalper_total": scalper_total,
+            "scalper_pl": scalper_pl,
+            "community_wins": community_wins,
+            "community_total": community_total,
+            "community_pl": community_pl,
+        }
+        await ws.send_str(json.dumps(data))
+        await asyncio.sleep(2)
 
 app = web.Application()
 app.router.add_get('/', html_handler)
 app.router.add_get('/ws', ws_handler)
 
-web.run_app(app, port=8080)
-
-import asyncio
-import json
-import os
-from aiohttp import web
-
-# ---- BEGIN: Fill these from your bot logic as globals ----
-current_wallet_balance = 0.0
-positions = {}
-activity_log = []
-exposure = 0.0
-daily_loss = 0.0
-
-def get_total_pl():
-    # Example stub: Replace with your real computation
-    return sum([pos.get('pl', 0) for pos in positions.values()])
-
-def calc_winrate():
-    # Example stub
-    wins, total = 0, 0
-    # Populate this logic using your trade logs/stats
-    return 100.0 * wins / total if total else 0
-
-# If your bot tracks more per-strategy stats, add them here
-bot_stats = dict(
-    ultra_wins=0, ultra_total=0, ultra_pl=0,
-    scalper_wins=0, scalper_total=0, scalper_pl=0,
-    community_wins=0, community_total=0, community_pl=0,
-)
-# ---- END MOCKS (replace with actual state!) ----
-
-DASHBOARD_FILE = os.path.abspath("dashboard.html")  # Adjust if your HTML path is elsewhere
+if __name__ == "__main__":
+    web.run_app(app, port=8080)
 
 async def ws_handler(request):
     ws = web.WebSocketResponse()
