@@ -1286,38 +1286,52 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
+import asyncio
+import json
+from aiohttp import web
+
+# -- DASHBOARD_HTML already defined above --
+
+# Serve dashboard at /
 async def html_handler(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
-    
+
+# Serve websocket at /ws
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+    print("WebSocket client connected!")
     while True:
-         data = {
-            "wallet_balance": current_wallet_balance,
-            "pl": get_total_pl(),
-            "winrate": calc_winrate(),
-            "positions": positions,
-            "exposure": exposure,
-            "daily_loss": daily_loss,
-            "log": list(activity_log)[-40:],
-            "ultra_wins": ultra_wins,
-            "ultra_total": ultra_total,
-            "ultra_pl": ultra_pl,
-            "scalper_wins": scalper_wins,
-            "scalper_total": scalper_total,
-            "scalper_pl": scalper_pl,
-            "community_wins": community_wins,
-            "community_total": community_total,
-            "community_pl": community_pl,
-        }
-    await ws.send_str(json.dumps(data))
-    await asyncio.sleep(2)
+        try:
+            data = {
+                "wallet_balance": current_wallet_balance,
+                "pl": get_total_pl(),
+                "winrate": calc_winrate(),
+                "positions": positions,
+                "exposure": exposure,
+                "daily_loss": daily_loss,
+                "log": list(activity_log)[-40:],
+                "ultra_wins": ultra_wins,
+                "ultra_total": ultra_total,
+                "ultra_pl": ultra_pl,
+                "scalper_wins": scalper_wins,
+                "scalper_total": scalper_total,
+                "scalper_pl": scalper_pl,
+                "community_wins": community_wins,
+                "community_total": community_total,
+                "community_pl": community_pl,
+            }
+            await ws.send_str(json.dumps(data))
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"WS send error: {e}")
+            break
+    return ws
 
+# --- App setup ---
 app = web.Application()
 app.router.add_get('/', html_handler)
 app.router.add_get('/ws', ws_handler)
-
 if __name__ == "__main__":
     web.run_app(app, port=8080)
 
